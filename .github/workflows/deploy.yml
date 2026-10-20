@@ -4,19 +4,16 @@
 #
 #   * Every hour it checks the source branch; when OnBelay/ has changed it deploys. Run it by hand any time:
 #     Actions > Deploy On Belay > Run workflow (a manual run always deploys).
-#   * Backend: applies the database migrations to the `onbelay` schema of the shared Supabase project, deploys the
-#     `onbelay-game-action` Edge Function, appends (never replaces) project settings, and smoke-tests the result.
-#     The project is shared with BoomTown, so nothing outside the onbelay schema is created or changed, except that
-#     guest (anonymous) sign-ins are switched on. See OnBelay/DEPLOYMENT.md in the source.
-#   * Site: builds with the project's public URL and anon/publishable key and commits the result here.
+#   * Game server: deploys OnBelay/server (a Cloudflare Worker with Durable Objects, free plan) with
+#     `wrangler deploy`, then plays one smoke-test round against the live server.
+#   * Site: builds with the server's URL and commits the result here.
 #
 # Settings (this repository > Settings > Secrets and variables > Actions):
 #   secret   BCSS_READ_TOKEN         fine-grained GitHub token: repository justinthomae/bcss, Contents read-only
-#   variable SUPABASE_PROJECT_REF    the Supabase project's reference ID (the xxxx in https://xxxx.supabase.co)
-#   secret   SUPABASE_ACCESS_TOKEN   Supabase personal access token
-#   secret   ONBELAY_DB_URL          the project's "Session pooler" connection string, password filled in
-# Without the three Supabase settings the site is still built and published, offline-only.
-# Logs here are public: nothing secret is printed (GitHub also masks secret values), and the anon key is public.
+#   secret   CLOUDFLARE_API_TOKEN    Cloudflare API token from the "Edit Cloudflare Workers" template
+#   variable CLOUDFLARE_ACCOUNT_ID   the Cloudflare account ID (Workers & Pages overview, right-hand side)
+# Without the two Cloudflare settings the site is still built and published, offline-only.
+# Logs here are public: nothing secret is printed (GitHub also masks secret values).
 name: Deploy On Belay
 
 on:
@@ -40,9 +37,8 @@ jobs:
       SOURCE_REPO: justinthomae/bcss
       SOURCE_BRANCH: claude/new-project-vnrnan
       SOURCE_TOKEN: ${{ secrets.BCSS_READ_TOKEN }}
-      PROJECT_REF: ${{ vars.SUPABASE_PROJECT_REF }}
-      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
-      ONBELAY_DB_URL: ${{ secrets.ONBELAY_DB_URL }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -65,8 +61,8 @@ jobs:
             echo "run=true" >> "$GITHUB_OUTPUT"
           fi
           online=false
-          if [ -n "$PROJECT_REF" ] && [ -n "$SUPABASE_ACCESS_TOKEN" ] && [ -n "$ONBELAY_DB_URL" ]; then online=true
-          else echo "::notice::Online play stays off: set SUPABASE_PROJECT_REF (variable), SUPABASE_ACCESS_TOKEN and ONBELAY_DB_URL (secrets)."; fi
+          if [ -n "$CLOUDFLARE_API_TOKEN" ] && [ -n "$CLOUDFLARE_ACCOUNT_ID" ]; then online=true
+          else echo "::notice::Online play stays off: set the CLOUDFLARE_API_TOKEN secret and the CLOUDFLARE_ACCOUNT_ID variable."; fi
           echo "online=$online" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-node@v4
@@ -82,75 +78,53 @@ jobs:
         run: |
           npm ci
           npm run typecheck
-          npx vitest run tests/engine tests/offline
+          npm run typecheck:server
+          npx vitest run tests/engine tests/offline tests/server/room.test.ts
 
-      - uses: supabase/setup-cli@v1
-        if: steps.src.outputs.run == 'true' && steps.src.outputs.online == 'true'
-        with:
-          version: latest
-
-      - name: Database (onbelay schema only)
+      - name: Deploy the game server
         if: steps.src.outputs.run == 'true' && steps.src.outputs.online == 'true'
         working-directory: src/OnBelay
         run: |
           set -euo pipefail
-          command -v psql >/dev/null || { sudo apt-get update -q && sudo apt-get install -y -q postgresql-client; }
-          scripts/db-migrate.sh "$ONBELAY_DB_URL"
+          npx wrangler deploy --config server/wrangler.toml --var "ALLOWED_ORIGINS:$SITE" 2>&1 | tee deploy.log
+          url=$(grep -Eo 'https://[A-Za-z0-9.-]+\.workers\.dev' deploy.log | head -n 1 || true)
+          test -n "$url" || { echo "::error::No workers.dev URL in the deploy output. In the Cloudflare dashboard, open Workers & Pages once to choose a workers.dev subdomain, then run this again."; exit 1; }
+          echo "Game server: $url"
+          echo "VITE_ONLINE_URL=$url" >> "$GITHUB_ENV"
 
-      - name: Game server function
-        if: steps.src.outputs.run == 'true' && steps.src.outputs.online == 'true'
-        working-directory: src/OnBelay
-        run: |
-          set -euo pipefail
-          supabase functions deploy onbelay-game-action --project-ref "$PROJECT_REF"
-          supabase secrets set --project-ref "$PROJECT_REF" "ONBELAY_ALLOWED_ORIGINS=$SITE"
-
-      - name: Project settings (append only)
+      - name: Smoke test the live game server
         if: steps.src.outputs.run == 'true' && steps.src.outputs.online == 'true'
         run: |
-          set -euo pipefail
-          api="https://api.supabase.com/v1/projects/$PROJECT_REF"
-          auth=(-H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" -H "Content-Type: application/json")
-          # Expose the onbelay schema to the REST API, keeping every schema already exposed.
-          schemas=$(curl -fsS "${auth[@]}" "$api/postgrest" | jq -r '.db_schema')
-          if ! tr ',' '\n' <<< "$schemas" | sed 's/ //g' | grep -qx onbelay; then
-            curl -fsS -X PATCH "${auth[@]}" "$api/postgrest" -d "$(jq -n --arg s "$schemas,onbelay" '{db_schema: $s}')" -o /dev/null
-            echo "Exposed schemas: $schemas,onbelay"
-          fi
-          # Guest sign-ins on; add the site to the redirect allow-list. Site URL and email settings are left alone.
-          allow=$(curl -fsS "${auth[@]}" "$api/config/auth" | jq -r '.uri_allow_list // ""')
-          if ! tr ',' '\n' <<< "$allow" | grep -qx "$SITE/\*\*"; then allow="${allow:+$allow,}$SITE/**"; fi
-          curl -fsS -X PATCH "${auth[@]}" "$api/config/auth" \
-            -d "$(jq -n --arg a "$allow" '{external_anonymous_users_enabled: true, uri_allow_list: $a}')" -o /dev/null
-
-      - name: Read the project's public key
-        if: steps.src.outputs.run == 'true' && steps.src.outputs.online == 'true'
-        run: |
-          set -euo pipefail
-          keys=$(curl -fsS -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" "https://api.supabase.com/v1/projects/$PROJECT_REF/api-keys")
-          anon=$(jq -r '[.[] | select(.name == "anon" or .type == "publishable") | .api_key][0] // empty' <<< "$keys")
-          test -n "$anon" || { echo "::error::No anon/publishable key found for the project"; exit 1; }
-          echo "VITE_SUPABASE_URL=https://$PROJECT_REF.supabase.co" >> "$GITHUB_ENV"
-          echo "VITE_SUPABASE_ANON_KEY=$anon" >> "$GITHUB_ENV"
-
-      - name: Smoke test the live backend
-        if: steps.src.outputs.run == 'true' && steps.src.outputs.online == 'true'
-        run: |
-          set -euo pipefail
-          # A guest can sign in, read the route table through RLS, and reach the game server.
-          token=$(curl -fsS -X POST "$VITE_SUPABASE_URL/auth/v1/signup" -H "apikey: $VITE_SUPABASE_ANON_KEY" \
-            -H "Content-Type: application/json" -d '{}' | jq -r '.access_token // empty')
-          test -n "$token" || { echo "::error::Anonymous sign-in failed"; exit 1; }
-          echo "::add-mask::$token"
-          routes=$(curl -fsS "$VITE_SUPABASE_URL/rest/v1/route_definitions?select=id" -H "Accept-Profile: onbelay" \
-            -H "apikey: $VITE_SUPABASE_ANON_KEY" -H "Authorization: Bearer $token")
-          echo "routes: $routes"
-          test "$(jq length <<< "$routes")" -ge 3 || { echo "::error::Route table missing or unreadable"; exit 1; }
-          code=$(curl -s -o resp.json -w '%{http_code}' -X POST "$VITE_SUPABASE_URL/functions/v1/onbelay-game-action" \
-            -H "apikey: $VITE_SUPABASE_ANON_KEY" -H "Authorization: Bearer $token" -H "Content-Type: application/json" \
-            -H "Origin: $SITE" -d '{}')
-          echo "onbelay-game-action $code: $(cat resp.json)"
-          [ "$code" = 400 ] || { echo "::error::onbelay-game-action should reject an empty request with 400"; exit 1; }
+          node --input-type=module -e '
+            const B = process.env.VITE_ONLINE_URL;
+            const origin = process.env.SITE;
+            const json = async (r) => ({ status: r.status, body: await r.json() });
+            let health;
+            for (let i = 0; i < 20; i++) {
+              health = await fetch(`${B}/health`).catch(() => null);
+              if (health?.ok) break;
+              await new Promise((r) => setTimeout(r, 3000));
+            }
+            if (!health?.ok) throw new Error("server not answering");
+            const guest = async () => (await json(await fetch(`${B}/api/guest`, { method: "POST", headers: { origin } }))).body;
+            const act = async (t, body) => json(await fetch(`${B}/api/action`, { method: "POST", headers: { origin, authorization: `Bearer ${t}`, "content-type": "application/json" }, body: JSON.stringify(body) }));
+            const view = async (t, id) => json(await fetch(`${B}/api/games/${id}`, { headers: { origin, authorization: `Bearer ${t}` } }));
+            const check = (ok, what) => { if (!ok) throw new Error(`smoke test failed: ${what}`); console.log(`ok - ${what}`); };
+            const a = await guest(), b = await guest();
+            const c = await act(a.token, { action: "create", routeId: "first-ascent", preferredRole: "climber", nickname: "Smoke A", avatar: "summit" });
+            check(c.status === 200 && /^[A-Z2-9]{6}$/.test(c.body.roomCode), "create a room");
+            check((await act(b.token, { action: "join", roomCode: c.body.roomCode, nickname: "Smoke B", avatar: "pine" })).status === 200, "join by code");
+            check((await act(a.token, { action: "start", gameId: c.body.gameId })).status === 200, "start");
+            const s = (card) => ({ gameId: c.body.gameId, action: "submit", round: 1, stateVersion: 1, submission: card });
+            check((await act(a.token, s({ role: "climber", action: "REACH", signal: null, teamworkPolicy: "NEVER" }))).body.resolved === false, "climber locks in");
+            const seen = await view(b.token, c.body.gameId);
+            check(seen.body.view.committed.climber && !/"action":"REACH"/.test(JSON.stringify(seen.body)), "partner sees the commit but not the card");
+            check((await act(b.token, s({ role: "belayer", action: "FEED", signal: null, teamworkPolicy: "NEVER" }))).body.resolved === true, "round resolves");
+            check((await view(a.token, c.body.gameId)).body.view.state.round === 2, "both reach round 2");
+            const outsider = await guest();
+            check((await view(outsider.token, c.body.gameId)).status === 404, "outsiders cannot read the game");
+            await act(a.token, { action: "forfeit", gameId: c.body.gameId });
+          '
 
       - name: Build site
         if: steps.src.outputs.run == 'true'
@@ -170,7 +144,7 @@ jobs:
           cp -r ../src/OnBelay/dist/. .
           find . -name '*.map' -delete
           echo "$TREE" > .source-tree
-          online=$([ -n "${VITE_SUPABASE_URL:-}" ] && echo "online play on" || echo "offline only")
+          online=$([ -n "${VITE_ONLINE_URL:-}" ] && echo "online play on" || echo "offline only")
           printf '# On Belay — published site\n\nBuilt game served by GitHub Pages at %s (%s).\n\nSource: `OnBelay/` in justinthomae/bcss (commit %s). Built and published by the "Deploy On Belay" workflow in this repository; do not edit the site files by hand.\n' \
             "$SITE" "$online" "$COMMIT" > README.md
           git config user.name "On Belay deploy"
