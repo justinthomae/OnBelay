@@ -11,7 +11,7 @@
 # Settings (this repository > Settings > Secrets and variables > Actions):
 #   secret   BCSS_READ_TOKEN         fine-grained GitHub token: repository justinthomae/bcss, Contents read-only
 #   secret   CLOUDFLARE_API_TOKEN    Cloudflare API token from the "Edit Cloudflare Workers" template
-#   variable CLOUDFLARE_ACCOUNT_ID   the Cloudflare account ID (Workers & Pages overview, right-hand side)
+#   variable CLOUDFLARE_ACCOUNT_ID   the Cloudflare account ID (Workers & Pages overview; a secret of that name also works)
 # Without the two Cloudflare settings the site is still built and published, offline-only.
 # Logs here are public: nothing secret is printed (GitHub also masks secret values).
 name: Deploy On Belay
@@ -38,7 +38,7 @@ jobs:
       SOURCE_BRANCH: claude/new-project-vnrnan
       SOURCE_TOKEN: ${{ secrets.BCSS_READ_TOKEN }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUNT_ID }}
     steps:
       - uses: actions/checkout@v4
         with:
