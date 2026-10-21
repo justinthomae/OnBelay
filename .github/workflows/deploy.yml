@@ -123,6 +123,8 @@ jobs:
             check((await view(a.token, c.body.gameId)).body.view.state.round === 2, "both reach round 2");
             const outsider = await guest();
             check((await view(outsider.token, c.body.gameId)).status === 404, "outsiders cannot read the game");
+            const junk = `${Buffer.from("{}").toString("base64url")}.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 600 })).toString("base64url")}.x`;
+            check((await fetch(`${B}/api/me`, { headers: { origin, authorization: `Bearer ${junk}` } })).status === 401, "Grudge Match sign-in service reachable (unknown token refused)");
             await act(a.token, { action: "forfeit", gameId: c.body.gameId });
           '
 
