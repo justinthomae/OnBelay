@@ -14,8 +14,23 @@
     <title>On Belay</title>
     <script type="module" crossorigin src="/assets/index-D_43h2a2.js"></script>
     <link rel="stylesheet" crossorigin href="/assets/index-BOVMeHHJ.css">
+    <style>
+      /* iOS 27 scroll-edge blur fix: an opaque full-width fixed strip at the top edge makes iOS fill the
+         status-bar band with this color instead of drawing its frosted blur. Above content (z-10/20),
+         below the round-reveal overlay (z-40), modals (z-50) and the connection banner (z-60). */
+      .ios-top-edge {
+        position: fixed;
+        top: 0; left: 0; right: 0;
+        width: 100%;
+        height: max(11px, env(safe-area-inset-top, 0px));
+        background: var(--ios-top-edge-color, #1e3d34);
+        pointer-events: none;
+        z-index: 30;
+      }
+    </style>
   <link rel="manifest" href="/manifest.webmanifest"></head>
   <body>
+    <div class="ios-top-edge" aria-hidden="true"></div>
     <div id="root"></div>
     <noscript>On Belay needs JavaScript to run.</noscript>
   </body>
